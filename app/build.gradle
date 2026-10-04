@@ -119,4 +119,8 @@ dependencies {
     implementation project(path: ':doubletapplayerview')
     implementation project(path: ':android-file-chooser')
     implementation fileTree(dir: "libs", include: ["lib-*.aar"])
+
+     // SMB-клиент для прямого доступа к сетевым папкам
+    implementation 'com.hierynomus:smbj:0.13.0'
+    implementation 'org.slf4j:slf4j-android:1.7.36'
 }

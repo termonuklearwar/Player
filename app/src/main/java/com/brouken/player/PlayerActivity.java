@@ -39,6 +39,9 @@ import android.util.Base64;
 import android.util.DisplayMetrics;
 import android.util.Rational;
 import android.util.TypedValue;
+
+import android.util.Log;
+
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -76,6 +79,8 @@ import androidx.media3.common.TrackSelectionOverride;
 import androidx.media3.common.TrackSelectionParameters;
 import androidx.media3.common.Tracks;
 import androidx.media3.datasource.DefaultHttpDataSource;
+import androidx.media3.exoplayer.DefaultLoadControl;
+import androidx.media3.exoplayer.LoadControl;
 import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlaybackException;
 import androidx.media3.exoplayer.ExoPlayer;
@@ -112,6 +117,8 @@ import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 
 public class PlayerActivity extends Activity {
+
+    private static final String SMB_PC_IP = "192.168.0.105";
 
     private PlayerListener playerListener;
     private BroadcastReceiver mReceiver;
@@ -222,6 +229,14 @@ public class PlayerActivity extends Activity {
         Utils.setOrientation(this, mPrefs.orientation);
 
         super.onCreate(savedInstanceState);
+
+          Intent playbackServiceIntent = new Intent(this, PlaybackService.class);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(playbackServiceIntent);
+        } else {
+            startService(playbackServiceIntent);
+        }
+
         if (Build.VERSION.SDK_INT == 28 && Build.MANUFACTURER.equalsIgnoreCase("xiaomi") &&
                 (Build.DEVICE.equalsIgnoreCase("oneday") || Build.DEVICE.equalsIgnoreCase("once"))) {
             setContentView(R.layout.activity_player_textureview);
@@ -755,6 +770,7 @@ public class PlayerActivity extends Activity {
             playerView.removeCallbacks(barsHider);
         }
         playerView.setCustomErrorMessage(null);
+        stopService(new Intent(this, PlaybackService.class));
         releasePlayer(false);
     }
 
@@ -1174,6 +1190,43 @@ public class PlayerActivity extends Activity {
         uri = Utils.convertToUTF(this, uri);
         mPrefs.updateSubtitle(uri);
     }
+    
+    /**
+     * Если URI — это ES-прокси (http://127.0.0.1:13096/SMB/...),
+     * конвертируем его в прямой smb:// ссылку на наш компьютер.
+     * Возвращает null, если URI не от ES.
+     */
+    private Uri convertEsProxyToSmb(Uri uri) {
+        if (uri == null) return null;
+        String scheme = uri.getScheme();
+        String host = uri.getHost();
+        int port = uri.getPort();
+        String path = uri.getPath();
+
+        if (!"http".equalsIgnoreCase(scheme)) return null;
+        if (host == null || !host.equals("127.0.0.1")) return null;
+        if (port != 13096) return null;
+        if (path == null || !path.startsWith("/SMB/")) return null;
+
+        // Разбираем путь: /SMB/0/Video/папка/файл.mkv
+        // Сегменты: [SMB, 0, Video, папка, файл.mkv]
+        java.util.List<String> segments = uri.getPathSegments();
+        if (segments.size() < 3) {
+            Log.e("PlayerActivity", "!!! ES URL too short: " + uri);
+            return null;
+        }
+
+        // Пропускаем "SMB" и "0" (индекс подключения в ES)
+        // Остальное — это share + путь внутри шары
+        Uri.Builder builder = new Uri.Builder();
+        builder.scheme("smb");
+        builder.authority(SMB_PC_IP);
+        for (int i = 2; i < segments.size(); i++) {
+            builder.appendPath(segments.get(i));
+        }
+        return builder.build();
+    }
+
 
     public void initializePlayer() {
         boolean isNetworkUri = Utils.isSupportedNetworkUri(mPrefs.mediaUri);
@@ -1227,24 +1280,57 @@ public class PlayerActivity extends Activity {
                 .setExtensionRendererMode(mPrefs.decoderPriority)
                 .setMapDV7ToHevc(mPrefs.mapDV7ToHevc);
 
+                        LoadControl loadControl = new DefaultLoadControl.Builder()
+                .setBufferDurationsMs(
+                        60000,      // minBufferMs — минимум 60 сек
+                        600000,     // maxBufferMs — до 10 минут вперёд
+                        2500,       // bufferForPlaybackMs
+                        5000        // bufferForPlaybackAfterRebufferMs
+                )
+                .setTargetBufferBytes(200 * 1024 * 1024)  // 200 МБ
+                .setPrioritizeTimeOverSizeThresholds(true)
+                .build();
+
         ExoPlayer.Builder playerBuilder = new ExoPlayer.Builder(this, renderersFactory)
                 .setTrackSelector(trackSelector)
+                .setLoadControl(loadControl)
                 .setMediaSourceFactory(new DefaultMediaSourceFactory(this, extractorsFactory));
 
-        if (haveMedia && isNetworkUri) {
-            if (mPrefs.mediaUri.getScheme().toLowerCase().startsWith("http")) {
-                HashMap<String, String> headers = new HashMap<>();
-                String userInfo = mPrefs.mediaUri.getUserInfo();
-                if (userInfo != null && userInfo.length() > 0 && userInfo.contains(":")) {
-                    headers.put("Authorization", "Basic " + Base64.encodeToString(userInfo.getBytes(), Base64.NO_WRAP));
-                    DefaultHttpDataSource.Factory defaultHttpDataSourceFactory = new DefaultHttpDataSource.Factory();
-                    defaultHttpDataSourceFactory.setDefaultRequestProperties(headers);
-                    playerBuilder.setMediaSourceFactory(new DefaultMediaSourceFactory(defaultHttpDataSourceFactory, extractorsFactory));
-                }
-            }
+       if (haveMedia && mPrefs.mediaUri != null && mPrefs.mediaUri.getScheme() != null) {
+    String scheme = mPrefs.mediaUri.getScheme().toLowerCase();
+
+    // Если пришла ссылка от ES File Explorer — конвертируем в прямой SMB
+    Uri directSmb = convertEsProxyToSmb(mPrefs.mediaUri);
+    if (directSmb != null) {
+        mPrefs.mediaUri = directSmb;
+        scheme = "smb";
+        Log.e("PlayerActivity", "!!! ES URL converted to: " + directSmb);
+    }
+
+    if (scheme.equals("smb")) {
+        SmbDataSource.Factory smbFactory = new SmbDataSource.Factory();
+        playerBuilder.setMediaSourceFactory(new DefaultMediaSourceFactory(smbFactory, extractorsFactory));
+    } else if (isNetworkUri && scheme.startsWith("http")) {
+        HashMap<String, String> headers = new HashMap<>();
+        String userInfo = mPrefs.mediaUri.getUserInfo();
+        if (userInfo != null && userInfo.length() > 0 && userInfo.contains(":")) {
+            headers.put("Authorization", "Basic " + Base64.encodeToString(userInfo.getBytes(), Base64.NO_WRAP));
+            DefaultHttpDataSource.Factory defaultHttpDataSourceFactory = new DefaultHttpDataSource.Factory();
+            defaultHttpDataSourceFactory.setDefaultRequestProperties(headers);
+            playerBuilder.setMediaSourceFactory(new DefaultMediaSourceFactory(defaultHttpDataSourceFactory, extractorsFactory));
         }
+    }
+}
 
         player = playerBuilder.build();
+
+        player.setTrackSelectionParameters(
+        player.getTrackSelectionParameters()
+                .buildUpon()
+                .setPreferredAudioLanguage("rus")
+                .setPreferredTextLanguage("rus")
+                .build()
+         );
 
         AudioAttributes audioAttributes = new AudioAttributes.Builder()
                 .setUsage(C.USAGE_MEDIA)
