@@ -66,6 +66,9 @@ import androidx.appcompat.app.AppCompatDelegate;
 import androidx.coordinatorlayout.widget.CoordinatorLayout;
 import androidx.core.content.ContextCompat;
 import androidx.documentfile.provider.DocumentFile;
+
+import androidx.media3.common.audio.AudioProcessor;
+
 import androidx.media3.common.AudioAttributes;
 import androidx.media3.common.C;
 import androidx.media3.common.Format;
@@ -119,6 +122,8 @@ import java.util.concurrent.TimeUnit;
 public class PlayerActivity extends Activity {
 
     private static final String SMB_PC_IP = "192.168.0.105";
+
+    private static final int UDP_AUDIO_PORT = 5004;
 
     private PlayerListener playerListener;
     private BroadcastReceiver mReceiver;
@@ -1276,20 +1281,26 @@ public class PlayerActivity extends Activity {
         DefaultExtractorsFactory extractorsFactory = new DefaultExtractorsFactory()
                 .setTsExtractorFlags(DefaultTsPayloadReaderFactory.FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS)
                 .setTsExtractorTimestampSearchBytes(1500 * TsExtractor.TS_PACKET_SIZE);
-        @SuppressLint("WrongConstant") RenderersFactory renderersFactory = new DefaultRenderersFactory(this)
-                .setExtensionRendererMode(mPrefs.decoderPriority)
-                .setMapDV7ToHevc(mPrefs.mapDV7ToHevc);
+        
+        UdpAudioProcessor udpAudioProcessor = new UdpAudioProcessor();
+        udpAudioProcessor.setTarget(SMB_PC_IP, UDP_AUDIO_PORT);
 
-                        LoadControl loadControl = new DefaultLoadControl.Builder()
-                .setBufferDurationsMs(
-                        60000,      // minBufferMs — минимум 60 сек
-                        600000,     // maxBufferMs — до 10 минут вперёд
-                        2500,       // bufferForPlaybackMs
-                        5000        // bufferForPlaybackAfterRebufferMs
-                )
-                .setTargetBufferBytes(200 * 1024 * 1024)  // 200 МБ
-                .setPrioritizeTimeOverSizeThresholds(true)
-                .build();
+        @SuppressLint("WrongConstant") RenderersFactory renderersFactory = new UdpRenderersFactory(
+        this,
+        new AudioProcessor[] { udpAudioProcessor })
+        
+        .setMapDV7ToHevc(mPrefs.mapDV7ToHevc);
+
+        LoadControl loadControl = new DefaultLoadControl.Builder()
+        .setBufferDurationsMs(
+                30000,      // 30 сек минимум
+                120000,     // 2 минуты максимум
+                2500,
+                5000
+        )
+        .setTargetBufferBytes(64 * 1024 * 1024)  // 64 МБ
+        .setPrioritizeTimeOverSizeThresholds(true)
+        .build();
 
         ExoPlayer.Builder playerBuilder = new ExoPlayer.Builder(this, renderersFactory)
                 .setTrackSelector(trackSelector)
@@ -1328,9 +1339,9 @@ public class PlayerActivity extends Activity {
         player.getTrackSelectionParameters()
                 .buildUpon()
                 .setPreferredAudioLanguage("rus")
-                .setPreferredTextLanguage("rus")
+                .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
                 .build()
-         );
+        );
 
         AudioAttributes audioAttributes = new AudioAttributes.Builder()
                 .setUsage(C.USAGE_MEDIA)

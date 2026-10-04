@@ -24,37 +24,43 @@ import com.hierynomus.smbj.share.File;
 
 import java.io.IOException;
 import java.util.EnumSet;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @UnstableApi
 public class SmbDataSource extends BaseDataSource {
 
     private static final String TAG = "SmbDataSource";
-    private static final int READ_CHUNK_SIZE = 1024 * 1024; // 1 МБ
+    private static final int NUM_READERS = 4;
+    private static final int READ_BLOCK_SIZE = 1024 * 1024;
+private static final int PREFETCH_QUEUE_SIZE = 10;
 
     public static class SmbConfig {
-        public final String host;
-        public final String share;
-        public final String path;
-        public final String user;
-        public final String password;
-        public final String domain;
-
+        public final String host, share, path, user, password, domain;
         public SmbConfig(String host, String share, String path,
                          String user, String password, String domain) {
-            this.host = host;
-            this.share = share;
-            this.path = path;
-            this.user = user;
-            this.password = password;
-            this.domain = domain;
+            this.host = host; this.share = share; this.path = path;
+            this.user = user; this.password = password; this.domain = domain;
         }
     }
 
-    private SMBClient smbClient;
-    private Connection connection;
-    private Session session;
-    private DiskShare diskShare;
-    private File smbFile;
+    private static class Reader {
+        SMBClient client;
+        Connection conn;
+        Session session;
+        DiskShare share;
+        File file;
+        int id;
+    }
+
+    private Reader[] readers = new Reader[NUM_READERS];
+    private SmbConfig config;
+    private ExecutorService executor;
 
     private Uri uri;
     private long fileSize;
@@ -62,13 +68,14 @@ public class SmbDataSource extends BaseDataSource {
     private long bytesRemaining;
     private boolean opened;
 
-    private byte[] internalBuffer;
-    private int bufferFilled = 0;
-    private int bufferPos = 0;
+    private BlockingQueue<byte[]> queue;
+    private Thread schedulerThread;
+    private final AtomicBoolean running = new AtomicBoolean(false);
 
-    public SmbDataSource() {
-        super(true);
-    }
+    private byte[] currentBlock;
+    private int currentBlockPos;
+
+    public SmbDataSource() { super(true); }
 
     public static SmbConfig parseUri(Uri uri, String user, String password, String domain) {
         if (uri == null || uri.getHost() == null || uri.getPathSegments().isEmpty()) {
@@ -86,142 +93,206 @@ public class SmbDataSource extends BaseDataSource {
 
     @Override
     public long open(DataSpec dataSpec) throws IOException {
-        Log.e(TAG, "!!! open() called, pos=" + dataSpec.position + " len=" + dataSpec.length + " uri=" + dataSpec.uri);
-
+        Log.e(TAG, "!!! open() pos=" + dataSpec.position);
         this.uri = dataSpec.uri;
         this.position = dataSpec.position;
-
-        SmbConfig config = parseUri(uri, SmbCredentials.user, SmbCredentials.password, SmbCredentials.domain);
-        Log.e(TAG, "!!! config: host=" + config.host + " share=" + config.share + " path=" + config.path);
+        this.config = parseUri(uri, SmbCredentials.user, SmbCredentials.password, SmbCredentials.domain);
 
         transferInitializing(dataSpec);
 
         try {
-            smbClient = new SMBClient();
-            connection = smbClient.connect(config.host);
-
-            AuthenticationContext auth = new AuthenticationContext(
-                    config.user,
-                    config.password != null ? config.password.toCharArray() : new char[0],
-                    config.domain != null ? config.domain : ""
-            );
-
-            session = connection.authenticate(auth);
-            diskShare = (DiskShare) session.connectShare(config.share);
-
-            if (!diskShare.fileExists(config.path)) {
-                throw new IOException("SMB file not found: " + config.path);
+            for (int i = 0; i < NUM_READERS; i++) {
+                readers[i] = openReader(i, config);
             }
+            Log.e(TAG, "!!! all readers ready");
 
-            SMB2CreateDisposition disposition = SMB2CreateDisposition.FILE_OPEN;
-            EnumSet<AccessMask> accessMask = EnumSet.of(AccessMask.GENERIC_READ);
-            EnumSet<SMB2ShareAccess> shareAccess = EnumSet.of(SMB2ShareAccess.FILE_SHARE_READ);
-            EnumSet<SMB2CreateOptions> createOptions = EnumSet.noneOf(SMB2CreateOptions.class);
-
-            smbFile = diskShare.openFile(
-                    config.path,
-                    accessMask,
-                    EnumSet.of(FileAttributes.FILE_ATTRIBUTE_NORMAL),
-                    shareAccess,
-                    disposition,
-                    createOptions
-            );
-
-            fileSize = smbFile.getFileInformation().getStandardInformation().getEndOfFile();
-
-            // ВАЖНО: всегда возвращаем полный размер от текущей позиции,
-            // игнорируем dataSpec.length — это только подсказка для одного запроса
+            fileSize = readers[0].file.getFileInformation().getStandardInformation().getEndOfFile();
             bytesRemaining = fileSize - position;
 
-            // Сбрасываем внутренний буфер
-            bufferFilled = 0;
-            bufferPos = 0;
+            queue = new ArrayBlockingQueue<>(PREFETCH_QUEUE_SIZE);
+            executor = Executors.newFixedThreadPool(NUM_READERS);
+
+            startScheduler(position);
 
             opened = true;
             transferStarted(dataSpec);
-
-            Log.e(TAG, "!!! open() SUCCESS, fileSize=" + fileSize + " position=" + position
-                    + " bytesRemaining=" + bytesRemaining);
+            Log.e(TAG, "!!! open SUCCESS fileSize=" + fileSize);
             return bytesRemaining;
 
         } catch (Exception e) {
-            Log.e(TAG, "!!! EXCEPTION: " + e.getClass().getSimpleName() + " - " + e.getMessage(), e);
+            Log.e(TAG, "!!! open EXCEPTION", e);
             close();
             throw new IOException("SMB open failed: " + e.getMessage(), e);
         }
+    }
+
+    private Reader openReader(int id, SmbConfig c) throws IOException {
+        Reader r = new Reader();
+        r.id = id;
+        com.hierynomus.smbj.SmbConfig sc = com.hierynomus.smbj.SmbConfig.builder()
+                .withTimeout(60, TimeUnit.SECONDS)
+                .withSoTimeout(60, TimeUnit.SECONDS)
+                .withReadTimeout(60, TimeUnit.SECONDS)
+                .withWriteTimeout(60, TimeUnit.SECONDS)
+                .withMultiProtocolNegotiate(true)
+                .build();
+        r.client = new SMBClient(sc);
+        r.conn = r.client.connect(c.host);
+        AuthenticationContext auth = new AuthenticationContext(
+                c.user,
+                c.password != null ? c.password.toCharArray() : new char[0],
+                c.domain != null ? c.domain : ""
+        );
+        r.session = r.conn.authenticate(auth);
+        r.share = (DiskShare) r.session.connectShare(c.share);
+
+        EnumSet<AccessMask> accessMask = EnumSet.of(AccessMask.GENERIC_READ);
+        EnumSet<SMB2ShareAccess> shareAccess = EnumSet.of(SMB2ShareAccess.FILE_SHARE_READ);
+        EnumSet<SMB2CreateOptions> opts = EnumSet.noneOf(SMB2CreateOptions.class);
+
+        r.file = r.share.openFile(
+                c.path, accessMask,
+                EnumSet.of(FileAttributes.FILE_ATTRIBUTE_NORMAL),
+                shareAccess, SMB2CreateDisposition.FILE_OPEN, opts);
+        return r;
+    }
+
+    private void startScheduler(long startPos) {
+        running.set(true);
+        schedulerThread = new Thread(() -> schedulerLoop(startPos), "SmbScheduler");
+        schedulerThread.setDaemon(true);
+        schedulerThread.start();
+    }
+
+    private void schedulerLoop(long startPos) {
+        long pos = startPos;
+        Log.e(TAG, "!!! scheduler start at " + pos);
+
+        while (running.get() && pos < fileSize) {
+            int count = (int) Math.min(NUM_READERS, (fileSize - pos + READ_BLOCK_SIZE - 1) / READ_BLOCK_SIZE);
+            if (count <= 0) break;
+
+            Future<byte[]>[] futures = new Future[count];
+            long batchStart = System.currentTimeMillis();
+
+            for (int i = 0; i < count; i++) {
+                final Reader r = readers[i];
+                final long readPos = pos + (long) i * READ_BLOCK_SIZE;
+                final int len = (int) Math.min(READ_BLOCK_SIZE, fileSize - readPos);
+                futures[i] = executor.submit(() -> readFromReader(r, readPos, len));
+            }
+
+            long elapsed = System.currentTimeMillis() - batchStart;
+            int totalBytes = 0;
+
+            for (int i = 0; i < count; i++) {
+                if (!running.get()) return;
+                byte[] data = null;
+                try { data = futures[i].get(120, TimeUnit.SECONDS); } catch (Exception e) {
+                    Log.e(TAG, "future " + i + " error", e);
+                    running.set(false);
+                    return;
+                }
+                if (data == null) { running.set(false); return; }
+
+                while (running.get()) {
+                    try {
+                        if (queue.offer(data, 200, TimeUnit.MILLISECONDS)) break;
+                    } catch (InterruptedException ie) { return; }
+                }
+                totalBytes += data.length;
+            }
+
+            long speed = (totalBytes / 1024) / Math.max(elapsed, 1);
+            Log.e(TAG, "!!! batch " + count + " = " + totalBytes + "B in " + elapsed
+                    + "ms speed=" + speed + "MB/s queue=" + queue.size());
+
+            pos += (long) count * READ_BLOCK_SIZE;
+        }
+        Log.e(TAG, "!!! scheduler done at " + pos);
+    }
+
+    private byte[] readFromReader(Reader r, long filePos, int length) throws IOException {
+        byte[] buffer = new byte[length];
+        int totalGot = 0;
+        while (totalGot < length) {
+            int chunk = (int) Math.min(1024 * 1024, length - totalGot);
+            int got = r.file.read(buffer, filePos + totalGot, totalGot, chunk);
+            if (got <= 0) break;
+            totalGot += got;
+        }
+        if (totalGot == length) return buffer;
+        byte[] trimmed = new byte[totalGot];
+        System.arraycopy(buffer, 0, trimmed, 0, totalGot);
+        return trimmed;
     }
 
     @Override
     public int read(byte[] buffer, int offset, int length) throws IOException {
         if (length == 0) return 0;
 
-        // Если буфер пуст — подтягиваем новый блок с SMB
-        if (bufferPos >= bufferFilled) {
-            if (bytesRemaining <= 0) {
+        if (currentBlock == null || currentBlockPos >= currentBlock.length) {
+            if (bytesRemaining <= 0 && (queue == null || queue.isEmpty())) {
                 return C.RESULT_END_OF_INPUT;
             }
-
-            if (internalBuffer == null) {
-                internalBuffer = new byte[READ_CHUNK_SIZE];
+            try {
+                currentBlock = (queue != null) ? queue.poll(60, TimeUnit.SECONDS) : null;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted");
             }
-
-            int want = (int) Math.min(READ_CHUNK_SIZE, bytesRemaining);
-            int got = smbFile.read(internalBuffer, position, 0, want);
-
-            if (got <= 0) {
-                return C.RESULT_END_OF_INPUT;
-            }
-
-            bufferFilled = got;
-            bufferPos = 0;
-            position += got;
-            bytesRemaining -= got;
-
-            Log.e(TAG, "!!! read chunk, got=" + got + " newPosition=" + position + " remaining=" + bytesRemaining);
+            if (currentBlock == null) return C.RESULT_END_OF_INPUT;
+            currentBlockPos = 0;
+            bytesRemaining -= currentBlock.length;
         }
 
-        int available = bufferFilled - bufferPos;
+        int available = currentBlock.length - currentBlockPos;
         int toCopy = Math.min(available, length);
-        System.arraycopy(internalBuffer, bufferPos, buffer, offset, toCopy);
-        bufferPos += toCopy;
+        System.arraycopy(currentBlock, currentBlockPos, buffer, offset, toCopy);
+        currentBlockPos += toCopy;
         bytesTransferred(toCopy);
         return toCopy;
     }
 
     @Nullable
     @Override
-    public Uri getUri() {
-        return uri;
-    }
+    public Uri getUri() { return uri; }
 
     @Override
     public void close() throws IOException {
         if (!opened) return;
         opened = false;
 
-        try { if (smbFile != null) smbFile.close(); } catch (Exception ignored) {}
-        try { if (diskShare != null) diskShare.close(); } catch (Exception ignored) {}
-        try { if (session != null) session.close(); } catch (Exception ignored) {}
-        try { if (connection != null) connection.close(); } catch (Exception ignored) {}
-        try { if (smbClient != null) smbClient.close(); } catch (Exception ignored) {}
+        running.set(false);
+        if (schedulerThread != null) {
+            schedulerThread.interrupt();
+            try { schedulerThread.join(1500); } catch (InterruptedException ignored) {}
+            schedulerThread = null;
+        }
+        if (executor != null) {
+            executor.shutdownNow();
+            try { executor.awaitTermination(1, TimeUnit.SECONDS); } catch (InterruptedException ignored) {}
+            executor = null;
+        }
+        if (queue != null) { queue.clear(); queue = null; }
 
-        smbFile = null;
-        diskShare = null;
-        session = null;
-        connection = null;
-        smbClient = null;
-        internalBuffer = null;
-        bufferFilled = 0;
-        bufferPos = 0;
+        for (Reader r : readers) {
+            if (r == null) continue;
+            try { if (r.file != null) r.file.close(); } catch (Exception ignored) {}
+            try { if (r.share != null) r.share.close(); } catch (Exception ignored) {}
+            try { if (r.session != null) r.session.close(); } catch (Exception ignored) {}
+            try { if (r.conn != null) r.conn.close(); } catch (Exception ignored) {}
+            try { if (r.client != null) r.client.close(); } catch (Exception ignored) {}
+        }
+        readers = new Reader[NUM_READERS];
+        currentBlock = null;
 
         transferEnded();
     }
 
     public static class Factory implements DataSource.Factory {
         @Override
-        public DataSource createDataSource() {
-            return new SmbDataSource();
-        }
+        public DataSource createDataSource() { return new SmbDataSource(); }
     }
 
     public static class SmbCredentials {
