@@ -6,6 +6,7 @@ import time
 import json
 import av
 import os
+import urllib.parse
 from collections import deque
 
 UDP_PORT = 5005
@@ -14,8 +15,9 @@ LOCAL_PREFIX = "F:\\"
 SAMPLE_RATE = 48000
 CHANNELS = 2
 BLOCK_SIZE = 1024
-MAX_BUFFER_SAMPLES = SAMPLE_RATE        # 1 сек буфера
-SEEK_THRESHOLD_MS = 2000                # если отстали больше 2 сек — ищем
+MAX_BUFFER_SAMPLES = SAMPLE_RATE
+SEEK_THRESHOLD_MS = 2000
+AUDIO_LEAD_MS = 300   # компенсация задержки: звук стартует на столько мс впереди позиции ТВ
 
 state_lock = threading.Lock()
 current_file = None
@@ -39,7 +41,10 @@ stop_event = threading.Event()
 def smb_to_local(smb):
     if not smb: return None
     if smb.startswith(SMB_PREFIX):
-        return LOCAL_PREFIX + smb[len(SMB_PREFIX):].replace('/', '\\')
+        rest = smb[len(SMB_PREFIX):]
+        # URL-decode для русских имён
+        rest = urllib.parse.unquote(rest)
+        return LOCAL_PREFIX + rest.replace('/', '\\')
     return None
 
 
@@ -92,7 +97,7 @@ def udp_thread():
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(('0.0.0.0', UDP_PORT))
     sock.settimeout(0.5)
-    print(f"[UDP] Слушаю порт {UDP_PORT}")
+    print(f"[UDP] Слушаю порт {UDP_PORT} (компенсация {AUDIO_LEAD_MS}ms)")
     while not stop_event.is_set():
         try:
             data, _ = sock.recvfrom(65536)
@@ -119,12 +124,19 @@ def udp_thread():
                 print(f"[SYNC] state: {prev_state} -> {st} @ {pos}ms")
                 if st != "PLAY":
                     buffer_clear()
-
+                elif st == "PLAY" and prev_state == "PAUSE":
+                    # После снятия паузы — принудительный resync
+                    resync_target_ms = pos
+                    resync_requested.set()
+                    buffer_clear()
+            
             if st == "PLAY":
+                # Сравниваем с учётом компенсации
+                expected = pos + AUDIO_LEAD_MS
                 actual = get_playback_pos_ms()
-                drift = pos - actual
+                drift = expected - actual
                 if abs(drift) > SEEK_THRESHOLD_MS:
-                    print(f"[SYNC] drift {drift}ms, resync to {pos}ms")
+                    print(f"[SYNC] drift {drift}ms, resync")
                     resync_target_ms = pos
                     resync_requested.set()
                     buffer_clear()
@@ -136,8 +148,6 @@ def udp_thread():
 
 
 def do_seek_to_target(container, stream, resampler, target_ms):
-    """Seek в контейнере + пропуск кадров до pts >= target_ms.
-    Возвращает (decoder, first_arr, first_pts_ms)."""
     container.seek(target_ms * 1000, backward=True)
     decoder = container.decode(stream)
     first_pts_ms = target_ms
@@ -175,7 +185,6 @@ def decoder_thread():
             target_ms = tv_position_ms
             st = tv_state
 
-        # === Файл сменился или только что открылся ===
         if path != current_path:
             if container:
                 try: container.close()
@@ -185,16 +194,21 @@ def decoder_thread():
             decoder = None
 
             if not path or not os.path.exists(path):
+                if path:
+                    print(f"[DEC] not found: {path}")
                 time.sleep(0.3)
                 continue
 
-            print(f"[DEC] opening {path} @ {target_ms}ms")
+            # Применяем компенсацию при первичном открытии
+            seek_ms = max(0, target_ms + AUDIO_LEAD_MS)
+
+            print(f"[DEC] opening {path} @ {seek_ms}ms (lead {AUDIO_LEAD_MS})")
             try:
                 container = av.open(path)
                 stream = container.streams.audio[0]
                 resampler = av.AudioResampler(format='fltp', layout='stereo', rate=SAMPLE_RATE)
                 decoder, first_arr, first_pts_ms = do_seek_to_target(
-                    container, stream, resampler, target_ms)
+                    container, stream, resampler, seek_ms)
 
                 buffer_clear()
                 with playback_lock:
@@ -216,10 +230,9 @@ def decoder_thread():
                 time.sleep(0.5)
             continue
 
-        # === Запрос на ресинк (перемотка на ТВ) ===
         if resync_requested.is_set():
             resync_requested.clear()
-            target = resync_target_ms
+            target = resync_target_ms + AUDIO_LEAD_MS
             print(f"[DEC] in-place seek to {target}ms")
             try:
                 decoder, first_arr, first_pts_ms = do_seek_to_target(
@@ -240,12 +253,10 @@ def decoder_thread():
                 current_path = None
             continue
 
-        # === Пауза ===
         if st != "PLAY":
             time.sleep(0.05)
             continue
 
-        # === Ждём свободное место в буфере ===
         while buffer_count() >= MAX_BUFFER_SAMPLES and not stop_event.is_set():
             time.sleep(0.02)
             with state_lock:
@@ -253,7 +264,6 @@ def decoder_thread():
                 if current_file != current_path: break
             if resync_requested.is_set(): break
 
-        # === Декодируем один кадр ===
         try:
             frame = next(decoder)
         except StopIteration:
@@ -286,13 +296,9 @@ def decoder_thread():
 
 
 def audio_callback(outdata, frames, time_info, status):
-    """КРИТИЧНО: samples_output += frames, а НЕ n.
-    Время идёт всегда, независимо от наличия данных в буфере."""
     global samples_output
-
     with state_lock:
         st = tv_state
-
     if st != "PLAY":
         outdata.fill(0)
         with playback_lock:
@@ -313,9 +319,9 @@ def audio_callback(outdata, frames, time_info, status):
 
 
 def main():
-    print("=== Audio Sync Receiver v5 ===")
+    print("=== Audio Sync Receiver v6 ===")
     print(f"Маппинг: {SMB_PREFIX}* -> {LOCAL_PREFIX}*")
-    print(f"Порог seek: {SEEK_THRESHOLD_MS}ms")
+    print(f"Компенсация задержки: {AUDIO_LEAD_MS}ms")
 
     threading.Thread(target=udp_thread, daemon=True).start()
     threading.Thread(target=decoder_thread, daemon=True).start()

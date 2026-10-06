@@ -785,31 +785,31 @@ public class PlayerActivity extends Activity {
     }
 
     @Override
-    public void onStop() {
-        super.onStop();
-        alive = false;
-        if (Build.VERSION.SDK_INT >= 31) {
-            playerView.removeCallbacks(barsHider);
-        }
-        playerView.setCustomErrorMessage(null);
-        stopService(new Intent(this, PlaybackService.class));
-
-        if (audioSyncHandler != null) {
-        audioSyncHandler.removeCallbacks(audioSyncRunnable);
-        }
-        
-        if (audioSyncSender != null) {
-            audioSyncSender.stop();
-            audioSyncSender = null;
-        }
-
-        releasePlayer(false);
-
-        if (audioSyncSender != null) {
-        audioSyncSender.clear();
-        }
-
+public void onStop() {
+    super.onStop();
+    alive = false;
+    if (Build.VERSION.SDK_INT >= 31) {
+        playerView.removeCallbacks(barsHider);
     }
+    playerView.setCustomErrorMessage(null);
+    stopService(new Intent(this, PlaybackService.class));
+
+    if (audioSyncHandler != null) {
+        audioSyncHandler.removeCallbacks(audioSyncRunnable);
+    }
+
+    // Отправляем финальное IDLE-сообщение ПЕРЕД остановкой
+    if (audioSyncSender != null) {
+        audioSyncSender.clear();
+        audioSyncSender.update(0, false);
+        audioSyncSender.send();
+        try { Thread.sleep(300); } catch (InterruptedException ignored) {}
+        audioSyncSender.stop();
+        audioSyncSender = null;
+    }
+
+    releasePlayer(false);
+}
 
     @SuppressLint("GestureBackNavigation")
     @Override
