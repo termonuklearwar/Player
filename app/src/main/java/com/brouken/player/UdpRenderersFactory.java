@@ -25,26 +25,24 @@ public class UdpRenderersFactory extends DefaultRenderersFactory {
     }
 
     @Override
-    protected AudioSink buildAudioSink(Context context, boolean enableFloatOutput,
-                                       boolean enableAudioTrackPlaybackParams) {
-        Log.e(TAG, "=== buildAudioSink() called");
+protected AudioSink buildAudioSink(Context context, boolean enableFloatOutput,
+                                   boolean enableAudioTrackPlaybackParams) {
+    Log.e(TAG, "=== buildAudioSink() called");
 
-        DefaultAudioSink.DefaultAudioProcessorChain chain =
-                new DefaultAudioSink.DefaultAudioProcessorChain(extraProcessors);
+    DefaultAudioSink.DefaultAudioProcessorChain chain =
+            new DefaultAudioSink.DefaultAudioProcessorChain(extraProcessors);
 
-        // Только PCM — это должно отключить passthrough
-        AudioCapabilities pcmOnly = new AudioCapabilities(
-                new int[] { C.ENCODING_PCM_16BIT, C.ENCODING_PCM_FLOAT },
-                2
-        );
+    // Разрешаем до 6 каналов (5.1), но только PCM
+    AudioCapabilities pcmOnly = new AudioCapabilities(
+            new int[] { C.ENCODING_PCM_16BIT, C.ENCODING_PCM_FLOAT },
+            6  // <-- ИЗМЕНЕНО: было 2, стало 6
+    );
 
-        // КРИТИЧНО: передаём null вместо context,
-        // чтобы sink использовал наши capabilities, а не системные
-        return new DefaultAudioSink.Builder(null)
-                .setAudioProcessorChain(chain)
-                .setAudioCapabilities(pcmOnly)
-                .setEnableFloatOutput(enableFloatOutput)
-                .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
-                .build();
+    return new DefaultAudioSink.Builder(null)
+            .setAudioProcessorChain(chain)
+            .setAudioCapabilities(pcmOnly)
+            .setEnableFloatOutput(enableFloatOutput)
+            .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+            .build();
     }
 }
