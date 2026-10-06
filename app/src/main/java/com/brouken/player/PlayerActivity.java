@@ -125,6 +125,23 @@ public class PlayerActivity extends Activity {
 
     private static final int UDP_AUDIO_PORT = 5004;
 
+    private static final int AUDIO_SYNC_PORT = 5005;
+
+    private AudioSyncSender audioSyncSender;
+    private android.os.Handler audioSyncHandler;
+    private final Runnable audioSyncRunnable = new Runnable() {
+    @Override
+    public void run() {
+        if (audioSyncSender != null && player != null) {
+            audioSyncSender.update(player.getCurrentPosition(), player.isPlaying());
+            audioSyncSender.send();
+            }
+        if (audioSyncHandler != null) {
+            audioSyncHandler.postDelayed(this, 500);
+            }
+        }
+    };
+
     private PlayerListener playerListener;
     private BroadcastReceiver mReceiver;
     private AudioManager mAudioManager;
@@ -776,7 +793,22 @@ public class PlayerActivity extends Activity {
         }
         playerView.setCustomErrorMessage(null);
         stopService(new Intent(this, PlaybackService.class));
+
+        if (audioSyncHandler != null) {
+        audioSyncHandler.removeCallbacks(audioSyncRunnable);
+        }
+        
+        if (audioSyncSender != null) {
+            audioSyncSender.stop();
+            audioSyncSender = null;
+        }
+
         releasePlayer(false);
+
+        if (audioSyncSender != null) {
+        audioSyncSender.clear();
+        }
+
     }
 
     @SuppressLint("GestureBackNavigation")
@@ -1285,6 +1317,14 @@ public class PlayerActivity extends Activity {
         UdpAudioProcessor udpAudioProcessor = new UdpAudioProcessor();
         udpAudioProcessor.setTarget(SMB_PC_IP, UDP_AUDIO_PORT);
 
+        // Инициализируем sync-канал
+        if (audioSyncSender == null) {
+            audioSyncSender = new AudioSyncSender(SMB_PC_IP, AUDIO_SYNC_PORT);
+            audioSyncSender.start();
+            audioSyncHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+            audioSyncHandler.postDelayed(audioSyncRunnable, 500);
+        }
+
         @SuppressLint("WrongConstant") RenderersFactory renderersFactory = new UdpRenderersFactory(
         this,
         new AudioProcessor[] { udpAudioProcessor })
@@ -1373,6 +1413,11 @@ public class PlayerActivity extends Activity {
         locked = false;
 
         if (haveMedia) {
+
+            if (audioSyncSender != null && mPrefs.mediaUri != null) {
+            audioSyncSender.setFile(mPrefs.mediaUri.toString());
+            }
+
             if (isNetworkUri) {
                 timeBar.setBufferedColor(DefaultTimeBar.DEFAULT_BUFFERED_COLOR);
             } else {
